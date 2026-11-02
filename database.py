@@ -122,10 +122,12 @@ def insert_import_history(data: dict):
 def update_employee_stats(emp_id: str, stats: dict):
     """製造実績・勤怠・不良実績などの補足データを社員レコードに保存"""
     sb = get_supabase()
-    payload = {"updated_at": datetime.utcnow().isoformat()}
+    payload = {}
     # stats のキーは process_count / defect / attendance / overtime / late / emp_memo
     for col in ("process_count", "defect", "attendance", "overtime", "late", "emp_memo"):
         if col in stats and stats[col] is not None:
             payload[col] = str(stats[col])
+    if not payload:
+        return []
     res = sb.table("employees").update(payload).eq("emp_id", emp_id).execute()
     return res.data
