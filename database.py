@@ -78,3 +78,37 @@ def parse_json_cols(ev: dict) -> dict:
         elif v is None:
             ev[col] = {}
     return ev
+
+# ============================================================
+# 日次記録
+# ============================================================
+def get_daily_records(emp_id: str = None, limit: int = 200):
+    sb = get_supabase()
+    q = sb.table("daily_records").select("*").order("record_date", desc=True).limit(limit)
+    if emp_id:
+        q = q.eq("emp_id", emp_id)
+    res = q.execute()
+    return res.data or []
+
+def insert_daily_record(data: dict):
+    sb = get_supabase()
+    data["created_at"] = datetime.utcnow().isoformat()
+    data["updated_at"] = datetime.utcnow().isoformat()
+    res = sb.table("daily_records").insert(data).execute()
+    return res.data
+
+def delete_daily_record(record_id: int):
+    sb = get_supabase()
+    sb.table("daily_records").delete().eq("id", record_id).execute()
+
+# ============================================================
+# 取込履歴
+# ============================================================
+def get_import_history(limit: int = 300):
+    sb = get_supabase()
+    res = sb.table("import_history").select("*").order("import_date", desc=True).limit(limit).execute()
+    return res.data or []
+
+def delete_import_history(record_id: int):
+    sb = get_supabase()
+    sb.table("import_history").delete().eq("id", record_id).execute()
