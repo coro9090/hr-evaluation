@@ -681,33 +681,90 @@ def page_bulk_import():
 
     # ファイルアップロード
     uploaded = st.file_uploader(
-        "CSVまたはExcelファイルをアップロード",
-        type=["csv", "xlsx", "xls", "xlsm"],
-        help="文字コードはUTF-8またはShift-JISに対応。マクロ付きExcel（.xlsm）にも対応"
+        "ファイルをアップロード（CSV / Excel / PDF / Word）",
+        type=["csv", "xlsx", "xls", "xlsm", "pdf", "docx", "doc"],
+        help="CSV・Excel（xlsx/xls/xlsm）・PDF・Word（docx）に対応"
     )
 
     if not uploaded:
         return
 
+    fname = uploaded.name.lower()
+
     # ファイル読み込み
     try:
-        if uploaded.name.endswith(".csv"):
+        if fname.endswith(".csv"):
             # UTF-8 → Shift-JIS の順で試行
             raw = uploaded.read()
+            df = None
             for enc in ["utf-8-sig", "utf-8", "shift_jis", "cp932"]:
                 try:
                     df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str)
                     break
                 except Exception:
                     continue
-            else:
+            if df is None:
                 st.error("CSVの文字コードを判別できませんでした")
                 return
+
+        elif fname.endswith(".pdf"):
+            import pdfplumber
+            raw = uploaded.read()
+            tables = []
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                for page in pdf.pages:
+                    tbl = page.extract_table()
+                    if tbl:
+                        tables.append(tbl)
+            if not tables:
+                # テーブルなし → テキスト抽出してプレビュー表示
+                with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                    text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+                st.warning("PDFにテーブルが見つかりませんでした。テキストを表示します（データ取込にはCSV/Excelを推奨）。")
+                st.text_area("PDFテキスト", text, height=400)
+                return
+            # 最初のテーブルを使用（複数ある場合はユーザーが選択）
+            if len(tables) > 1:
+                tbl_idx = st.selectbox(
+                    "取込するテーブルを選択",
+                    list(range(len(tables))),
+                    format_func=lambda i: f"テーブル {i+1}（{len(tables[i])}行）"
+                )
+                tbl = tables[tbl_idx]
+            else:
+                tbl = tables[0]
+            header = tbl[0]
+            rows = tbl[1:]
+            df = pd.DataFrame(rows, columns=header).fillna("").astype(str)
+
+        elif fname.endswith(".docx"):
+            from docx import Document as DocxDoc
+            raw = uploaded.read()
+            doc = DocxDoc(io.BytesIO(raw))
+            if not doc.tables:
+                # テーブルなし → パラグラフをテキスト表示
+                text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                st.warning("Wordファイルにテーブルが見つかりませんでした（データ取込にはCSV/Excelを推奨）。")
+                st.text_area("Wordテキスト", text, height=400)
+                return
+            if len(doc.tables) > 1:
+                tbl_idx = st.selectbox(
+                    "取込するテーブルを選択",
+                    list(range(len(doc.tables))),
+                    format_func=lambda i: f"テーブル {i+1}（{len(doc.tables[i].rows)}行）"
+                )
+                tbl = doc.tables[tbl_idx]
+            else:
+                tbl = doc.tables[0]
+            rows = [[cell.text for cell in row.cells] for row in tbl.rows]
+            header = rows[0]
+            df = pd.DataFrame(rows[1:], columns=header).fillna("").astype(str)
+
         else:
-            # xlsm（マクロ付き）も openpyxl で読み込み可能
-            # まずシート一覧を取得
+            # Excel系（xlsx / xls / xlsm）
             import openpyxl
-            wb = openpyxl.load_workbook(io.BytesIO(uploaded.read()), read_only=True, data_only=True)
+            raw_bytes = uploaded.read()
+            wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
             sheet_names = wb.sheetnames
             wb.close()
             uploaded.seek(0)
@@ -721,7 +778,9 @@ def page_bulk_import():
             else:
                 selected_sheet = sheet_names[0]
 
-            df = pd.read_excel(uploaded, sheet_name=selected_sheet, dtype=str, engine="openpyxl")
+            df = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=selected_sheet,
+                               dtype=str, engine="openpyxl")
+
     except Exception as e:
         st.error(f"ファイル読み込みエラー: {e}")
         return
