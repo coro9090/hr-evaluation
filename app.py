@@ -682,8 +682,8 @@ def page_bulk_import():
     # ファイルアップロード
     uploaded = st.file_uploader(
         "CSVまたはExcelファイルをアップロード",
-        type=["csv", "xlsx", "xls"],
-        help="文字コードはUTF-8またはShift-JISに対応"
+        type=["csv", "xlsx", "xls", "xlsm"],
+        help="文字コードはUTF-8またはShift-JISに対応。マクロ付きExcel（.xlsm）にも対応"
     )
 
     if not uploaded:
@@ -704,7 +704,24 @@ def page_bulk_import():
                 st.error("CSVの文字コードを判別できませんでした")
                 return
         else:
-            df = pd.read_excel(uploaded, dtype=str)
+            # xlsm（マクロ付き）も openpyxl で読み込み可能
+            # まずシート一覧を取得
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(uploaded.read()), read_only=True, data_only=True)
+            sheet_names = wb.sheetnames
+            wb.close()
+            uploaded.seek(0)
+
+            if len(sheet_names) > 1:
+                selected_sheet = st.selectbox(
+                    "読み込むシートを選択",
+                    sheet_names,
+                    help="取込対象のシートを選んでください"
+                )
+            else:
+                selected_sheet = sheet_names[0]
+
+            df = pd.read_excel(uploaded, sheet_name=selected_sheet, dtype=str, engine="openpyxl")
     except Exception as e:
         st.error(f"ファイル読み込みエラー: {e}")
         return
@@ -713,33 +730,54 @@ def page_bulk_import():
 
     st.subheader(f"プレビュー（{len(df)}行）")
     st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+    st.caption(f"列名: {', '.join(df.columns.tolist())}")
 
-    # カラムマッピング
+    # カラムマッピング（自動マッチング）
     col_map = {
-        "社員番号": ["社員番号", "emp_id", "社員ID", "ID"],
-        "年度":   ["年度", "year"],
-        "期":     ["期", "period"],
-        "等級":   ["等級", "grade_level", "等級レベル"],
-        "個人目標": ["個人目標", "pg_goal", "個人目標の内容"],
-        "個人目標グレード": ["個人目標グレード", "pg_grade"],
-        "調整点数": ["調整点数", "adj_points", "調整"],
-        "被評価者コメント": ["被評価者コメント", "evaluatee_comment"],
-        "評価者コメント": ["評価者コメント", "evaluator_comment"],
+        "社員番号": ["社員番号", "emp_id", "社員ID", "ID", "No", "NO", "no", "番号", "社員No"],
+        "年度":   ["年度", "year", "評価年度", "年"],
+        "期":     ["期", "period", "評価期", "上下期"],
+        "等級":   ["等級", "grade_level", "等級レベル", "グレード", "grade"],
+        "個人目標": ["個人目標", "pg_goal", "個人目標の内容", "目標", "目標内容"],
+        "個人目標グレード": ["個人目標グレード", "pg_grade", "目標グレード", "個人目標評価"],
+        "調整点数": ["調整点数", "adj_points", "調整", "加減点"],
+        "被評価者コメント": ["被評価者コメント", "evaluatee_comment", "本人コメント", "自己コメント"],
+        "評価者コメント": ["評価者コメント", "evaluator_comment", "上長コメント", "上司コメント"],
     }
 
     def find_col(df_cols, candidates):
         for c in candidates:
             if c in df_cols:
                 return c
+        # 部分一致も試みる
+        for c in candidates:
+            for dc in df_cols:
+                if c in dc or dc in c:
+                    return dc
         return None
 
     cols = df.columns.tolist()
     mapped = {k: find_col(cols, v) for k, v in col_map.items()}
 
+    # 自動マッピング結果を表示
+    with st.expander("🔧 列マッピング確認（クリックして展開）"):
+        for k, v in mapped.items():
+            req = "✅" if v else ("⚠️ 必須" if k in ["社員番号","年度","期"] else "（任意）")
+            st.write(f"{req} **{k}** → `{v or '未マッピング'}`")
+
+        # 必須列が未マッピングの場合は手動選択
+        missing_required = [k for k in ["社員番号", "年度", "期"] if not mapped[k]]
+        if missing_required:
+            st.warning(f"必須列を手動で選択してください: {', '.join(missing_required)}")
+            none_opt = ["（選択してください）"] + cols
+            for req_k in missing_required:
+                sel = st.selectbox(f"「{req_k}」に対応する列", none_opt, key=f"manual_{req_k}")
+                if sel != "（選択してください）":
+                    mapped[req_k] = sel
+
     missing_required = [k for k in ["社員番号", "年度", "期"] if not mapped[k]]
     if missing_required:
-        st.error(f"必須列が見つかりません: {', '.join(missing_required)}")
-        st.write("ファイルの列名:", cols)
+        st.error(f"必須列が選択されていません: {', '.join(missing_required)}")
         return
 
     employees = get_all_employees()
