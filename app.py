@@ -14,7 +14,8 @@ from database import (get_all_employees, get_employee, upsert_employee,
                       delete_employee, get_evaluations, get_evaluation,
                       upsert_evaluation, delete_evaluation, parse_json_cols,
                       get_daily_records, insert_daily_record, delete_daily_record,
-                      get_import_history, delete_import_history, insert_import_history)
+                      get_import_history, delete_import_history, insert_import_history,
+                      update_employee_stats)
 from excel_export import export_excel
 
 # ============================================================
@@ -89,33 +90,55 @@ if st.sidebar.button("🚪 ログアウト"):
 def grade_badge(g):
     return f'<span class="grade-badge grade-{g}">{g}</span>'
 
-def ai_score(emp_name, grade_level, pg_goal, items, obs_text):
-    """Claude APIで採点"""
+def ai_score(emp_name, grade_level, pg_goal, items, obs_text, emp_stats=None):
+    """Claude APIで採点（製造実績・勤怠データも活用）"""
     api_key = st.secrets.get("anthropic_api_key", "")
     if not api_key:
         return None, "APIキーが設定されていません"
 
-    item_list = "\n".join([f"- {iname}（最大{max_pts}点）: {obs}"
+    item_list = "\n".join([f"- {iname}（最大{max_pts}点, A={gpts.get('A',0)}/B={gpts.get('B',0)}/C={gpts.get('C',0)}/D={gpts.get('D',0)}/E={gpts.get('E',0)}点）: {obs}"
                            for iid,cat,iname,max_pts,gpts,obs in items])
-    pg_pts_dict = PG_POINTS_BY_GRADE[grade_level]
     item_grades_json = "{" + ",".join([f'"{iid}":"A/B/C/D/E"' for iid,*_ in items]) + "}"
 
-    prompt = f"""あなたは製造業の人事評価の専門家です。
-以下の従業員を評価してください。
+    # 製造実績・勤怠データを追加
+    stats_text = ""
+    if emp_stats:
+        parts = []
+        if emp_stats.get("process_count"):
+            parts.append(f"加工本数/月: {emp_stats['process_count']}本")
+        if emp_stats.get("defect"):
+            parts.append(f"不良率: {emp_stats['defect']}%")
+        if emp_stats.get("attendance"):
+            parts.append(f"出勤率: {emp_stats['attendance']}%")
+        if emp_stats.get("overtime"):
+            parts.append(f"残業: {emp_stats['overtime']}h/月")
+        if emp_stats.get("late"):
+            parts.append(f"遅刻: {emp_stats['late']}回")
+        if emp_stats.get("emp_memo"):
+            parts.append(f"メモ: {emp_stats['emp_memo']}")
+        if parts:
+            stats_text = "\n【製造実績・勤怠データ】\n" + " / ".join(parts)
 
-従業員名: {emp_name}
-等級: {grade_level}
+    prompt = f"""あなたは株式会社栄工舎 製造第1課の人事評価担当者です。
+以下の課員データを分析し、A/B/C/D/Eグレードで評価してください。
+
+【被評価者情報】
+氏名: {emp_name}　等級: {grade_level}
 個人目標: {pg_goal or '（未記入）'}
-観察・備考: {obs_text or '（なし）'}
+観察・備考: {obs_text or '（なし）'}{stats_text}
 
-【評価項目】
+【グレード基準】
+A=目標を大幅超過, B=目標を概ね達成, C=標準レベル, D=やや不足, E=大幅不足
+最終評価: A=90点以上, B=76点以上, C=55点以上, D=40点以上, E=39点以下
+
+【評価項目（A〜Eで評価）】
 {item_list}
 
 以下のJSON形式のみで回答してください（説明不要）:
 {{
   "pg_grade": "A/B/C/D/E のいずれか",
   "item_grades": {item_grades_json},
-  "comment": "総合コメント（200字以内）"
+  "comment": "評価コメント（200字以内、具体的な根拠を含む）"
 }}"""
 
     body = json.dumps({
@@ -349,8 +372,10 @@ def page_eval_input():
     with col_ai1:
         if st.button("🤖 AI採点", use_container_width=True):
             with st.spinner("AIが採点中..."):
+                # 製造実績・勤怠データを取得してAIに渡す
+                emp_stats = {k: emp.get(k) for k in ("process_count", "defect", "attendance", "overtime", "late", "emp_memo")}
                 result, err = ai_score(
-                    emp["name"], grade_level, pg_goal, items, obs_lines
+                    emp["name"], grade_level, pg_goal, items, obs_lines, emp_stats
                 )
             if err:
                 st.error(f"AI採点エラー: {err}")
@@ -639,6 +664,167 @@ def page_import_history():
                 st.rerun()
 
 # ============================================================
+# 製造実績取込ヘルパー
+# ============================================================
+def _process_production_import(df, uploaded):
+    """集計シートから製造実績を解析し、社員プロフィールに保存"""
+    import pandas as pd
+
+    # --- Unnamed列の処理: 全列がUnnamedなら1行目をヘッダーに昇格 ---
+    if all(str(c).startswith("Unnamed") for c in df.columns):
+        df.columns = df.iloc[0].astype(str).str.strip()
+        df = df.iloc[1:].reset_index(drop=True)
+        df = df.fillna("")
+
+    st.subheader(f"📋 プレビュー（{len(df)}行）")
+    st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+    st.caption(f"列名: {', '.join(df.columns.tolist())}")
+
+    cols = df.columns.tolist()
+
+    # 「担当」列を探す
+    def find_like(candidates):
+        for c in candidates:
+            if c in cols:
+                return c
+        for c in candidates:
+            for dc in cols:
+                if c in str(dc):
+                    return dc
+        return None
+
+    col_person = find_like(["担当", "担当者", "氏名", "名前", "社員名"])
+    col_total  = find_like(["合計", "総合計", "計", "total"])
+    col_std    = find_like(["標準", "標準加工"])
+    col_sp     = find_like(["特殊", "特殊加工"])
+    col_proc   = find_like(["工程", "process"])
+
+    st.markdown("**列マッピング確認**")
+    c1, c2 = st.columns(2)
+    c1.write(f"担当者列: `{col_person or '未検出'}`")
+    c1.write(f"合計列: `{col_total or '未検出'}`")
+    c2.write(f"標準列: `{col_std or '（任意）'}`")
+    c2.write(f"特殊列: `{col_sp or '（任意）'}`")
+
+    if not col_person:
+        none_opt = ["（選択してください）"] + cols
+        sel = st.selectbox("「担当者」に対応する列を選択", none_opt, key="prod_col_person")
+        col_person = sel if sel != "（選択してください）" else None
+
+    if not col_total:
+        none_opt = ["（選択してください）"] + cols
+        sel = st.selectbox("「合計（生産本数）」に対応する列を選択", none_opt, key="prod_col_total")
+        col_total = sel if sel != "（選択してください）" else None
+
+    if not col_person or not col_total:
+        st.error("担当者列と合計列を特定できませんでした。列を手動で選択してください。")
+        return
+
+    # 数値変換
+    def to_num(v):
+        try:
+            return float(str(v).replace(",", "").strip())
+        except:
+            return 0.0
+
+    df["_person"] = df[col_person].astype(str).str.strip()
+    df["_total_num"] = df[col_total].apply(to_num)
+
+    # 空白行・ヘッダー繰り返し行を除外
+    df = df[df["_person"].str.len() > 0]
+    df = df[df["_person"] != col_person]
+    df = df[~df["_person"].isin(["担当", "担当者", "氏名", "名前", "合計", "計", "小計", "nan"])]
+
+    # 担当者ごとに合計
+    summary = df.groupby("_person")["_total_num"].sum().reset_index()
+    summary.columns = ["担当者", "合計本数"]
+    summary["合計本数"] = summary["合計本数"].astype(int)
+    summary = summary[summary["合計本数"] > 0].sort_values("合計本数", ascending=False)
+
+    st.markdown("---")
+    st.subheader("📊 集計結果（担当者別 合計本数）")
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    if summary.empty:
+        st.warning("集計データが空です。列マッピングを確認してください。")
+        return
+
+    # 社員マッチング
+    employees = get_all_employees()
+    emp_by_name = {e["name"]: e for e in employees}
+    emp_by_id   = {e["emp_id"]: e for e in employees}
+
+    match_rows = []
+    for _, row in summary.iterrows():
+        name = row["担当者"]
+        emp = emp_by_name.get(name)
+        # 部分一致を試みる
+        if not emp:
+            for ename, e in emp_by_name.items():
+                if name in ename or ename in name:
+                    emp = e
+                    break
+        match_rows.append({
+            "担当者": name,
+            "合計本数": row["合計本数"],
+            "マッチ": emp["name"] if emp else "❌ 未マッチ",
+            "社員番号": emp["emp_id"] if emp else "",
+            "_emp": emp,
+        })
+
+    df_match = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in match_rows])
+    st.subheader("👤 社員マッチング結果")
+    st.dataframe(df_match, use_container_width=True, hide_index=True)
+
+    matched = [r for r in match_rows if r["_emp"]]
+    unmatched = [r for r in match_rows if not r["_emp"]]
+
+    col_a, col_b = st.columns(2)
+    col_a.metric("マッチ", f"{len(matched)} 名")
+    col_b.metric("未マッチ", f"{len(unmatched)} 名")
+
+    if unmatched:
+        st.warning(f"以下の担当者は社員マスタに見つかりませんでした（スキップ）: " +
+                   ", ".join([r["担当者"] for r in unmatched]))
+
+    if not matched:
+        st.error("保存対象の社員がいません")
+        return
+
+    if st.button(f"💾 {len(matched)} 名の製造実績を保存", type="primary", use_container_width=True):
+        ok, ng = 0, 0
+        ng_details = []
+        for r in matched:
+            emp = r["_emp"]
+            try:
+                update_employee_stats(emp["emp_id"], {
+                    "process_count": str(r["合計本数"]),
+                    "emp_memo": f"製造実績取込: {r['合計本数']}本/月（{uploaded.name}）",
+                })
+                ok += 1
+            except Exception as ex:
+                ng += 1
+                ng_details.append(f"{emp['name']}: {ex}")
+
+        insert_import_history({
+            "file_name": uploaded.name,
+            "file_type": "製造実績",
+            "affected_count": ok,
+            "detail": f"加工本数保存 {ok}名 / 未マッチ {len(unmatched)}名 / エラー {ng}名",
+            "status": "完了" if ng == 0 else "一部エラー",
+        })
+
+        if ok:
+            st.success(f"✅ {ok} 名の製造実績を保存しました！AI採点時に自動で参照されます。")
+        if ng:
+            st.error(f"❌ {ng} 件エラー")
+            for d in ng_details[:5]:
+                st.write(d)
+        if ok:
+            st.info("「📝 評価入力」で社員を選び「🤖 AI採点」をクリックすると、この実績が採点に反映されます。")
+
+
+# ============================================================
 # ページ: 一括取込
 # ============================================================
 def page_bulk_import():
@@ -646,11 +832,29 @@ def page_bulk_import():
 
     import pandas as pd
 
-    st.markdown("""
-    CSVまたはExcelファイルから評価データを一括インポートします。
+    # 取込モード選択
+    mode = st.radio(
+        "取込モードを選択",
+        ["🔧 製造実績取込（実績データ → 社員プロフィールに保存）",
+         "📋 評価データ取込（評価点・目標などを直接インポート）"],
+        key="bulk_import_mode"
+    )
+    is_production_mode = mode.startswith("🔧")
 
-    **取込対象:** 評価データ（基本情報・個人目標・コメント）
-    """)
+    if is_production_mode:
+        st.markdown("""
+        **製造実績ファイル**（集計シート）を取込み、各社員の**加工本数・月次実績**を
+        社員プロフィールに保存します。保存後は **AI採点** で自動的にその実績が参照されます。
+
+        対応フォーマット: Excel（xlsm / xlsx）
+        集計シートの列: 担当 / 工程 / 標準 / 特殊 / 合計 など
+        """)
+    else:
+        st.markdown("""
+        CSVまたはExcelファイルから評価データを一括インポートします。
+
+        **取込対象:** 評価データ（基本情報・個人目標・コメント）
+        """)
 
     # テンプレートダウンロード
     with st.expander("📄 CSVテンプレートをダウンロード"):
@@ -786,6 +990,13 @@ def page_bulk_import():
         return
 
     df = df.fillna("")
+
+    # =====================================================
+    # 製造実績モード: 担当・合計列を集計して社員に保存
+    # =====================================================
+    if is_production_mode:
+        _process_production_import(df, uploaded)
+        return
 
     st.subheader(f"プレビュー（{len(df)}行）")
     st.dataframe(df.head(20), use_container_width=True, hide_index=True)
