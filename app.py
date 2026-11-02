@@ -6,6 +6,7 @@ AI人事評価システム Web版
 import streamlit as st
 import json, ssl, urllib.request, urllib.error
 from datetime import datetime
+import io
 
 from constants import (GRADE_LEVELS, GRADE_EVAL_ITEMS, PG_POINTS_BY_GRADE,
                        GRADE_THRESHOLDS, calc_final_grade)
@@ -13,7 +14,7 @@ from database import (get_all_employees, get_employee, upsert_employee,
                       delete_employee, get_evaluations, get_evaluation,
                       upsert_evaluation, delete_evaluation, parse_json_cols,
                       get_daily_records, insert_daily_record, delete_daily_record,
-                      get_import_history, delete_import_history)
+                      get_import_history, delete_import_history, insert_import_history)
 from excel_export import export_excel
 
 # ============================================================
@@ -73,7 +74,8 @@ st.sidebar.markdown("**栄工舎 製造第1課**")
 st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "メニュー",
-    ["📝 評価入力", "📋 評価一覧", "👥 社員管理", "📊 統計", "📅 日次記録", "📂 取込履歴"],
+    ["📝 評価入力", "📋 評価一覧", "👥 社員管理", "📊 統計",
+     "📅 日次記録", "📂 取込履歴", "📥 一括取込"],
     label_visibility="collapsed"
 )
 st.sidebar.markdown("---")
@@ -136,7 +138,6 @@ def ai_score(emp_name, grade_level, pg_goal, items, obs_text):
         with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
             resp = json.loads(r.read())
         text = resp["content"][0]["text"].strip()
-        # JSONブロック抽出
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -154,7 +155,7 @@ def calc_total(grade_level, pg_grade, item_grades_dict, adj=0):
     return pg_pts, item_total, total
 
 # ============================================================
-# ページ: 評価入力
+# ページ: 評価入力（既存データ自動ロード対応）
 # ============================================================
 def page_eval_input():
     st.title("📝 人事評価入力")
@@ -174,13 +175,79 @@ def page_eval_input():
     with col2:
         period = st.selectbox("期", ["上期", "下期"])
     with col3:
+        # 読み込んだ等級があればそれを使う
+        gl_default = st.session_state.get("_ev_grade_level") or emp.get("grade_level", "A2")
+        if gl_default not in GRADE_LEVELS:
+            gl_default = "A2"
         grade_level = st.selectbox("等級", GRADE_LEVELS,
-                                   index=GRADE_LEVELS.index(emp.get("grade_level","A2")))
+                                   index=GRADE_LEVELS.index(gl_default))
 
     items = GRADE_EVAL_ITEMS[grade_level]
     pg_pts_map = PG_POINTS_BY_GRADE[grade_level]
     grade_opts = [f"{g}（{v}点）" for g, v in pg_pts_map.items()]
     grade_keys = list(pg_pts_map.keys())
+
+    # ★ 既存評価データの自動ロード ★
+    load_key = f"{emp['emp_id']}_{int(year)}_{period}"
+    if st.session_state.get("_eval_load_key") != load_key:
+        evals = get_evaluations(emp["emp_id"])
+        existing = next(
+            (parse_json_cols(e) for e in evals
+             if e["year"] == int(year) and e["period"] == period),
+            None
+        )
+        if existing:
+            gl = existing.get("grade_level") or "A2"
+            if gl not in GRADE_LEVELS:
+                gl = "A2"
+            loaded_pg_map = PG_POINTS_BY_GRADE.get(gl, pg_pts_map)
+            loaded_grade_opts = [f"{g}（{v}点）" for g, v in loaded_pg_map.items()]
+            loaded_items = GRADE_EVAL_ITEMS.get(gl, items)
+
+            pg_g = existing.get("pg_grade") or "C"
+            pg_label = f"{pg_g}（{loaded_pg_map.get(pg_g, 0)}点）"
+            if pg_label not in loaded_grade_opts:
+                pg_label = loaded_grade_opts[2] if len(loaded_grade_opts) > 2 else loaded_grade_opts[0]
+
+            st.session_state["_ev_grade_level"] = gl
+            st.session_state["pg_goal"] = existing.get("pg_goal") or ""
+            st.session_state["pg_grade"] = pg_label
+            for iid, cat, iname, max_pts, gpts, obs in loaded_items:
+                ig = (existing.get("item_grades") or {}).get(iid, "E")
+                opts_i = [f"{g}（{v}点）" for g, v in gpts.items()]
+                ig_label = f"{ig}（{gpts.get(ig, 0)}点）"
+                st.session_state[f"ig_{iid}"] = ig_label if ig_label in opts_i else opts_i[-1]
+            st.session_state["adj_points"] = int(existing.get("adj_points") or 0)
+            st.session_state["ev_comment"] = existing.get("evaluatee_comment") or ""
+            st.session_state["er_comment"] = existing.get("evaluator_comment") or ""
+            st.session_state["ev1"] = existing.get("evaluator1") or ""
+            st.session_state["ev2"] = existing.get("evaluator2") or ""
+            st.session_state["obs_text"] = ""
+            st.session_state["_existing_eval_id"] = existing.get("id")
+        else:
+            st.session_state["_ev_grade_level"] = None
+            st.session_state["pg_goal"] = ""
+            st.session_state["pg_grade"] = grade_opts[2] if len(grade_opts) > 2 else grade_opts[0]
+            for iid, cat, iname, max_pts, gpts, obs in items:
+                opts_i = [f"{g}（{v}点）" for g, v in gpts.items()]
+                st.session_state[f"ig_{iid}"] = opts_i[-1]
+            st.session_state["adj_points"] = 0
+            st.session_state["ev_comment"] = ""
+            st.session_state["er_comment"] = ""
+            st.session_state["ev1"] = ""
+            st.session_state["ev2"] = ""
+            st.session_state["obs_text"] = ""
+            st.session_state["_existing_eval_id"] = None
+
+        st.session_state["_eval_load_key"] = load_key
+        st.rerun()
+
+    # 読み込み状態の表示
+    existing_id = st.session_state.get("_existing_eval_id")
+    if existing_id:
+        st.success(f"✅ 既存の評価データを読み込みました（更新モード）")
+    else:
+        st.info("📝 新規評価入力")
 
     st.markdown("---")
     st.subheader("個人目標")
@@ -219,7 +286,7 @@ def page_eval_input():
 
     # 調整点数
     st.markdown("---")
-    adj = st.number_input("調整点数（±）", value=0, min_value=-20, max_value=20)
+    adj = st.number_input("調整点数（±）", value=0, min_value=-20, max_value=20, key="adj_points")
 
     # 合計計算
     pg_pts_val, item_total, total = calc_total(grade_level, pg_grade, item_grade_selections, adj)
@@ -233,10 +300,48 @@ def page_eval_input():
 
     st.markdown("---")
     col_e, col_f = st.columns(2)
-    evaluatee_comment = col_e.text_area("被評価者コメント", height=80)
-    evaluator_comment = col_f.text_area("評価者コメント", height=80)
-    evaluator1 = col_e.text_input("一次評価者")
-    evaluator2 = col_f.text_input("二次評価者")
+    evaluatee_comment = col_e.text_area("被評価者コメント", height=80, key="ev_comment")
+    evaluator_comment = col_f.text_area("評価者コメント", height=80, key="er_comment")
+    evaluator1 = col_e.text_input("一次評価者", key="ev1")
+    evaluator2 = col_f.text_input("二次評価者", key="ev2")
+
+    def build_ev(ai_data=None):
+        if ai_data:
+            ai_pg = ai_data["pg_grade"]
+            ai_ig = ai_data["item_grades"]
+            ai_pg_pts = pg_pts_map.get(ai_pg, 0)
+            ai_item_pts = {iid: GRADE_EVAL_ITEMS[grade_level][i][4].get(ai_ig.get(iid,"E"),0)
+                           for i, (iid,*_) in enumerate(items)}
+            ai_total = ai_pg_pts + sum(ai_item_pts.values()) + adj
+            ev = {
+                "emp_id": emp["emp_id"], "year": int(year), "period": period,
+                "grade_level": grade_level,
+                "pg_grade": ai_pg, "pg_points": ai_pg_pts, "pg_goal": pg_goal,
+                "item_grades": ai_ig, "item_points": ai_item_pts,
+                "adj_points": adj, "total_score": ai_total,
+                "final_grade": calc_final_grade(ai_total),
+                "evaluator1": evaluator1, "evaluator2": evaluator2,
+                "evaluatee_comment": evaluatee_comment,
+                "evaluator_comment": evaluator_comment,
+                "ai_comment": ai_data.get("comment", ""),
+            }
+        else:
+            item_pts = {iid: GRADE_EVAL_ITEMS[grade_level][i][4].get(item_grade_selections.get(iid,"E"),0)
+                        for i, (iid,*_) in enumerate(items)}
+            ev = {
+                "emp_id": emp["emp_id"], "year": int(year), "period": period,
+                "grade_level": grade_level,
+                "pg_grade": pg_grade, "pg_points": pg_pts_val, "pg_goal": pg_goal,
+                "item_grades": item_grade_selections, "item_points": item_pts,
+                "adj_points": adj, "total_score": total, "final_grade": final_g,
+                "evaluator1": evaluator1, "evaluator2": evaluator2,
+                "evaluatee_comment": evaluatee_comment,
+                "evaluator_comment": evaluator_comment,
+                "ai_comment": "",
+            }
+        if st.session_state.get("_existing_eval_id"):
+            ev["id"] = st.session_state["_existing_eval_id"]
+        return ev
 
     # AI採点ボタン
     st.markdown("---")
@@ -250,58 +355,25 @@ def page_eval_input():
             if err:
                 st.error(f"AI採点エラー: {err}")
             else:
-                pg_g = result.get("pg_grade", "C")
-                ig_map = result.get("item_grades", {})
-                comment = result.get("comment", "")
-                st.session_state["ai_result"] = {
-                    "pg_grade": pg_g, "item_grades": ig_map, "comment": comment
-                }
-                st.success(f"AI採点完了！コメント: {comment}")
+                st.session_state["ai_result"] = result
+                st.success(f"AI採点完了！コメント: {result.get('comment','')}")
                 st.info("「AI採点を反映して保存」ボタンで保存できます。")
 
     with col_ai2:
         if "ai_result" in st.session_state and st.button("💾 AI採点を反映して保存", use_container_width=True):
-            ai = st.session_state["ai_result"]
-            ai_pg = ai["pg_grade"]
-            ai_ig = ai["item_grades"]
-            ai_pg_pts = pg_pts_map.get(ai_pg, 0)
-            ai_item_pts = {iid: GRADE_EVAL_ITEMS[grade_level][i][4].get(ai_ig.get(iid,"E"),0)
-                           for i, (iid,*_) in enumerate(items)}
-            ai_total = ai_pg_pts + sum(ai_item_pts.values()) + adj
-            ai_final = calc_final_grade(ai_total)
-            ev = {
-                "emp_id": emp["emp_id"],
-                "year": int(year), "period": period,
-                "grade_level": grade_level,
-                "pg_grade": ai_pg, "pg_points": ai_pg_pts, "pg_goal": pg_goal,
-                "item_grades": ai_ig, "item_points": ai_item_pts,
-                "adj_points": adj, "total_score": ai_total, "final_grade": ai_final,
-                "evaluator1": evaluator1, "evaluator2": evaluator2,
-                "evaluatee_comment": evaluatee_comment,
-                "evaluator_comment": evaluator_comment,
-                "ai_comment": ai["comment"],
-            }
-            upsert_evaluation(ev)
+            ev = build_ev(ai_data=st.session_state["ai_result"])
+            result = upsert_evaluation(ev)
+            if result and not st.session_state.get("_existing_eval_id"):
+                st.session_state["_existing_eval_id"] = result[0].get("id")
             st.success("AI採点結果を保存しました！")
             del st.session_state["ai_result"]
 
     with col_save:
         if st.button("💾 手動評価を保存", use_container_width=True):
-            item_pts = {iid: GRADE_EVAL_ITEMS[grade_level][i][4].get(item_grade_selections.get(iid,"E"),0)
-                        for i, (iid,*_) in enumerate(items)}
-            ev = {
-                "emp_id": emp["emp_id"],
-                "year": int(year), "period": period,
-                "grade_level": grade_level,
-                "pg_grade": pg_grade, "pg_points": pg_pts_val, "pg_goal": pg_goal,
-                "item_grades": item_grade_selections, "item_points": item_pts,
-                "adj_points": adj, "total_score": total, "final_grade": final_g,
-                "evaluator1": evaluator1, "evaluator2": evaluator2,
-                "evaluatee_comment": evaluatee_comment,
-                "evaluator_comment": evaluator_comment,
-                "ai_comment": "",
-            }
-            upsert_evaluation(ev)
+            ev = build_ev()
+            result = upsert_evaluation(ev)
+            if result and not st.session_state.get("_existing_eval_id"):
+                st.session_state["_existing_eval_id"] = result[0].get("id")
             st.success("評価を保存しました！")
 
 # ============================================================
@@ -338,7 +410,6 @@ def page_eval_list():
             c2.markdown(f"**調整点数:** {ev.get('adj_points',0)}点")
             c2.markdown(f"**AIコメント:** {ev.get('ai_comment','')}")
 
-            # 評価項目一覧
             items = GRADE_EVAL_ITEMS.get(ev["grade_level"], [])
             rows = []
             for iid,cat,iname,max_pts,gpts,obs in items:
@@ -349,7 +420,6 @@ def page_eval_list():
                 import pandas as pd
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-            # 削除 / Excel出力
             col_del, col_xl = st.columns(2)
             with col_del:
                 if st.button("🗑️ 削除", key=f"del_{ev['id']}"):
@@ -469,7 +539,6 @@ def page_daily_records():
     tab_list, tab_add = st.tabs(["記録一覧", "新規登録"])
 
     with tab_list:
-        # 絞り込み
         options = ["全員"] + [f"{e['emp_id']} {e['name']}" for e in employees]
         filter_sel = st.selectbox("社員で絞り込み", options, key="dr_filter")
         emp_id_filter = None
@@ -570,6 +639,247 @@ def page_import_history():
                 st.rerun()
 
 # ============================================================
+# ページ: 一括取込
+# ============================================================
+def page_bulk_import():
+    st.title("📥 一括取込")
+
+    import pandas as pd
+
+    st.markdown("""
+    CSVまたはExcelファイルから評価データを一括インポートします。
+
+    **取込対象:** 評価データ（基本情報・個人目標・コメント）
+    """)
+
+    # テンプレートダウンロード
+    with st.expander("📄 CSVテンプレートをダウンロード"):
+        template_data = {
+            "社員番号": ["1", "2"],
+            "年度": [2026, 2026],
+            "期": ["上期", "下期"],
+            "等級": ["A2", "A2"],
+            "個人目標": ["目標テキストをここに入力", ""],
+            "個人目標グレード": ["B", "C"],
+            "調整点数": [0, 0],
+            "被評価者コメント": ["", ""],
+            "評価者コメント": ["", ""],
+        }
+        df_template = pd.DataFrame(template_data)
+        csv_template = df_template.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            "⬇️ テンプレートCSVをダウンロード",
+            csv_template.encode("utf-8-sig"),
+            "評価データ取込テンプレート.csv",
+            mime="text/csv",
+        )
+        st.dataframe(df_template, use_container_width=True, hide_index=True)
+        st.caption("※ 個人目標グレードは A/B/C/D/E のいずれかを入力してください")
+        st.caption("※ 等級は A1/A2/B1/B2/C1/C2 のいずれかを入力してください")
+
+    st.markdown("---")
+
+    # ファイルアップロード
+    uploaded = st.file_uploader(
+        "CSVまたはExcelファイルをアップロード",
+        type=["csv", "xlsx", "xls"],
+        help="文字コードはUTF-8またはShift-JISに対応"
+    )
+
+    if not uploaded:
+        return
+
+    # ファイル読み込み
+    try:
+        if uploaded.name.endswith(".csv"):
+            # UTF-8 → Shift-JIS の順で試行
+            raw = uploaded.read()
+            for enc in ["utf-8-sig", "utf-8", "shift_jis", "cp932"]:
+                try:
+                    df = pd.read_csv(io.BytesIO(raw), encoding=enc, dtype=str)
+                    break
+                except Exception:
+                    continue
+            else:
+                st.error("CSVの文字コードを判別できませんでした")
+                return
+        else:
+            df = pd.read_excel(uploaded, dtype=str)
+    except Exception as e:
+        st.error(f"ファイル読み込みエラー: {e}")
+        return
+
+    df = df.fillna("")
+
+    st.subheader(f"プレビュー（{len(df)}行）")
+    st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+
+    # カラムマッピング
+    col_map = {
+        "社員番号": ["社員番号", "emp_id", "社員ID", "ID"],
+        "年度":   ["年度", "year"],
+        "期":     ["期", "period"],
+        "等級":   ["等級", "grade_level", "等級レベル"],
+        "個人目標": ["個人目標", "pg_goal", "個人目標の内容"],
+        "個人目標グレード": ["個人目標グレード", "pg_grade"],
+        "調整点数": ["調整点数", "adj_points", "調整"],
+        "被評価者コメント": ["被評価者コメント", "evaluatee_comment"],
+        "評価者コメント": ["評価者コメント", "evaluator_comment"],
+    }
+
+    def find_col(df_cols, candidates):
+        for c in candidates:
+            if c in df_cols:
+                return c
+        return None
+
+    cols = df.columns.tolist()
+    mapped = {k: find_col(cols, v) for k, v in col_map.items()}
+
+    missing_required = [k for k in ["社員番号", "年度", "期"] if not mapped[k]]
+    if missing_required:
+        st.error(f"必須列が見つかりません: {', '.join(missing_required)}")
+        st.write("ファイルの列名:", cols)
+        return
+
+    employees = get_all_employees()
+    emp_set = {e["emp_id"] for e in employees}
+
+    # バリデーション
+    errors = []
+    valid_rows = []
+    for i, row in df.iterrows():
+        emp_id = str(row.get(mapped["社員番号"], "")).strip()
+        year_raw = str(row.get(mapped["年度"], "")).strip()
+        period = str(row.get(mapped["期"], "")).strip()
+
+        if not emp_id:
+            errors.append(f"行{i+2}: 社員番号が空")
+            continue
+        try:
+            year = int(float(year_raw))
+        except:
+            errors.append(f"行{i+2}: 年度が不正 ({year_raw})")
+            continue
+        if period not in ["上期", "下期"]:
+            errors.append(f"行{i+2}: 期が不正 ({period}) ← 上期 or 下期")
+            continue
+
+        gl_col = mapped.get("等級")
+        gl = str(row.get(gl_col, "A2")).strip() if gl_col else "A2"
+        if gl not in GRADE_LEVELS:
+            gl = "A2"
+
+        pg_goal_col = mapped.get("個人目標")
+        pg_goal = str(row.get(pg_goal_col, "")).strip() if pg_goal_col else ""
+
+        pg_grade_col = mapped.get("個人目標グレード")
+        pg_grade = str(row.get(pg_grade_col, "C")).strip().upper() if pg_grade_col else "C"
+        if pg_grade not in ["A", "B", "C", "D", "E"]:
+            pg_grade = "C"
+
+        adj_col = mapped.get("調整点数")
+        try:
+            adj = int(float(row.get(adj_col, 0))) if adj_col else 0
+        except:
+            adj = 0
+
+        ev_comment_col = mapped.get("被評価者コメント")
+        ev_comment = str(row.get(ev_comment_col, "")).strip() if ev_comment_col else ""
+
+        er_comment_col = mapped.get("評価者コメント")
+        er_comment = str(row.get(er_comment_col, "")).strip() if er_comment_col else ""
+
+        pg_pts_map = PG_POINTS_BY_GRADE.get(gl, {})
+        pg_pts = pg_pts_map.get(pg_grade, 0)
+        total = pg_pts + adj
+        final_g = calc_final_grade(total)
+
+        valid_rows.append({
+            "emp_id": emp_id, "year": year, "period": period,
+            "grade_level": gl, "pg_goal": pg_goal,
+            "pg_grade": pg_grade, "pg_points": pg_pts,
+            "item_grades": {}, "item_points": {},
+            "adj_points": adj, "total_score": total, "final_grade": final_g,
+            "evaluatee_comment": ev_comment, "evaluator_comment": er_comment,
+            "evaluator1": "", "evaluator2": "", "ai_comment": "",
+        })
+
+    if errors:
+        st.warning(f"以下の行にエラーがあります（スキップします）:")
+        for e in errors[:10]:
+            st.write(f"  - {e}")
+
+    if not valid_rows:
+        st.error("取込可能なデータがありません")
+        return
+
+    st.success(f"✅ {len(valid_rows)} 件が取込可能です（エラー: {len(errors)} 件）")
+
+    # 重複チェック
+    existing_evals = get_evaluations()
+    existing_keys = {(str(e["emp_id"]), e["year"], e["period"]) for e in existing_evals}
+    new_rows = [r for r in valid_rows if (r["emp_id"], r["year"], r["period"]) not in existing_keys]
+    update_rows = [r for r in valid_rows if (r["emp_id"], r["year"], r["period"]) in existing_keys]
+
+    col_a, col_b = st.columns(2)
+    col_a.metric("新規追加", f"{len(new_rows)} 件")
+    col_b.metric("上書き更新", f"{len(update_rows)} 件")
+
+    overwrite = st.checkbox("既存データを上書きする（チェックなし=新規のみ取込）")
+
+    rows_to_import = new_rows + (update_rows if overwrite else [])
+
+    if not rows_to_import:
+        st.info("取込対象がありません（全て既存データです）")
+        return
+
+    if st.button(f"📥 {len(rows_to_import)} 件を取込実行", type="primary", use_container_width=True):
+        ok = 0
+        ng = 0
+        ng_details = []
+        progress = st.progress(0)
+        for idx, rec in enumerate(rows_to_import):
+            # 既存データのIDを取得して上書き
+            if overwrite and (rec["emp_id"], rec["year"], rec["period"]) in existing_keys:
+                matched = next(
+                    (e for e in existing_evals
+                     if str(e["emp_id"]) == rec["emp_id"]
+                     and e["year"] == rec["year"]
+                     and e["period"] == rec["period"]),
+                    None
+                )
+                if matched:
+                    rec["id"] = matched["id"]
+            try:
+                upsert_evaluation(rec)
+                ok += 1
+            except Exception as ex:
+                ng += 1
+                ng_details.append(f"  社員{rec['emp_id']} {rec['year']}{rec['period']}: {ex}")
+            progress.progress((idx + 1) / len(rows_to_import))
+
+        # 取込履歴に記録
+        detail = f"新規:{len(new_rows)}件, 更新:{len(update_rows) if overwrite else 0}件, エラー:{ng}件"
+        insert_import_history({
+            "file_name": uploaded.name,
+            "file_type": "CSV" if uploaded.name.endswith(".csv") else "Excel",
+            "affected_count": ok,
+            "detail": detail,
+            "status": "完了" if ng == 0 else "一部エラー",
+        })
+
+        if ok:
+            st.success(f"✅ {ok} 件の取込が完了しました！")
+        if ng:
+            st.error(f"❌ {ng} 件でエラーが発生しました")
+            for d in ng_details[:5]:
+                st.write(d)
+
+        st.info("「📋 評価一覧」で取込結果を確認できます")
+        st.info("取込履歴は「📂 取込履歴」に記録されました")
+
+# ============================================================
 # ルーティング
 # ============================================================
 if "📝 評価入力" in page:
@@ -584,3 +894,5 @@ elif "📅 日次記録" in page:
     page_daily_records()
 elif "📂 取込履歴" in page:
     page_import_history()
+elif "📥 一括取込" in page:
+    page_bulk_import()
