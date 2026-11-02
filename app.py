@@ -11,7 +11,9 @@ from constants import (GRADE_LEVELS, GRADE_EVAL_ITEMS, PG_POINTS_BY_GRADE,
                        GRADE_THRESHOLDS, calc_final_grade)
 from database import (get_all_employees, get_employee, upsert_employee,
                       delete_employee, get_evaluations, get_evaluation,
-                      upsert_evaluation, delete_evaluation, parse_json_cols)
+                      upsert_evaluation, delete_evaluation, parse_json_cols,
+                      get_daily_records, insert_daily_record, delete_daily_record,
+                      get_import_history, delete_import_history)
 from excel_export import export_excel
 
 # ============================================================
@@ -71,7 +73,7 @@ st.sidebar.markdown("**栄工舎 製造第1課**")
 st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "メニュー",
-    ["📝 評価入力", "📋 評価一覧", "👥 社員管理", "📊 統計"],
+    ["📝 評価入力", "📋 評価一覧", "👥 社員管理", "📊 統計", "📅 日次記録", "📂 取込履歴"],
     label_visibility="collapsed"
 )
 st.sidebar.markdown("---")
@@ -456,6 +458,118 @@ def page_stats():
     st.bar_chart(grade_counts)
 
 # ============================================================
+# ページ: 日次記録
+# ============================================================
+def page_daily_records():
+    st.title("📅 日次記録")
+
+    employees = get_all_employees()
+    emp_map = {e["emp_id"]: e["name"] for e in employees}
+
+    tab_list, tab_add = st.tabs(["記録一覧", "新規登録"])
+
+    with tab_list:
+        # 絞り込み
+        options = ["全員"] + [f"{e['emp_id']} {e['name']}" for e in employees]
+        filter_sel = st.selectbox("社員で絞り込み", options, key="dr_filter")
+        emp_id_filter = None
+        if filter_sel != "全員":
+            emp_id_filter = filter_sel.split()[0]
+
+        records = get_daily_records(emp_id_filter)
+        if not records:
+            st.info("日次記録がありません。")
+        else:
+            st.write(f"**{len(records)} 件**")
+            import pandas as pd
+            rows = []
+            for r in records:
+                rows.append({
+                    "ID": r["id"],
+                    "日付": r.get("record_date", ""),
+                    "社員名": emp_map.get(str(r.get("emp_id","")), r.get("emp_name","")),
+                    "カテゴリ": r.get("category", ""),
+                    "記録": r.get("record_text", "")[:60] + ("..." if len(r.get("record_text","")) > 60 else ""),
+                })
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.subheader("詳細・削除")
+            for r in records:
+                name = emp_map.get(str(r.get("emp_id","")), r.get("emp_name",""))
+                with st.expander(f"{r.get('record_date','')} | {name} | {r.get('category','')}"):
+                    st.write(r.get("record_text",""))
+                    if st.button("🗑️ 削除", key=f"dr_del_{r['id']}"):
+                        delete_daily_record(r["id"])
+                        st.success("削除しました")
+                        st.rerun()
+
+    with tab_add:
+        st.subheader("日次記録 新規登録")
+        with st.form("dr_form"):
+            emp_opts = {f"{e['emp_id']} {e['name']}": e["emp_id"] for e in employees}
+            sel_emp = st.selectbox("社員", list(emp_opts.keys()))
+            record_date = st.date_input("日付")
+            category = st.text_input("カテゴリ（例：作業記録、改善提案）")
+            record_text = st.text_area("記録内容", height=120)
+            submitted = st.form_submit_button("💾 保存")
+            if submitted:
+                eid = emp_opts[sel_emp]
+                ename = emp_map.get(str(eid), "")
+                insert_daily_record({
+                    "emp_id": str(eid),
+                    "emp_name": ename,
+                    "record_date": str(record_date),
+                    "category": category,
+                    "record_text": record_text,
+                })
+                st.success("記録を保存しました！")
+                st.rerun()
+
+# ============================================================
+# ページ: 取込履歴
+# ============================================================
+def page_import_history():
+    st.title("📂 取込履歴")
+
+    records = get_import_history()
+    if not records:
+        st.info("取込履歴がありません。")
+        return
+
+    st.write(f"**{len(records)} 件**")
+
+    import pandas as pd
+    rows = []
+    for r in records:
+        rows.append({
+            "ID": r["id"],
+            "取込日時": r.get("import_date", ""),
+            "ファイル名": r.get("file_name", ""),
+            "種別": r.get("file_type", ""),
+            "件数": r.get("affected_count", 0),
+            "状態": r.get("status", ""),
+            "詳細": r.get("detail", "")[:50] + ("..." if len(r.get("detail","")) > 50 else ""),
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("詳細")
+    for r in records:
+        label = f"{r.get('import_date','')} | {r.get('file_name','')} | {r.get('status','')}"
+        with st.expander(label):
+            col1, col2 = st.columns(2)
+            col1.write(f"**ファイル種別:** {r.get('file_type','')}")
+            col1.write(f"**件数:** {r.get('affected_count',0)}")
+            col2.write(f"**詳細:** {r.get('detail','')}")
+            if st.button("🗑️ 削除", key=f"ih_del_{r['id']}"):
+                delete_import_history(r["id"])
+                st.success("削除しました")
+                st.rerun()
+
+# ============================================================
 # ルーティング
 # ============================================================
 if "📝 評価入力" in page:
@@ -466,3 +580,7 @@ elif "👥 社員管理" in page:
     page_employees()
 elif "📊 統計" in page:
     page_stats()
+elif "📅 日次記録" in page:
+    page_daily_records()
+elif "📂 取込履歴" in page:
+    page_import_history()
