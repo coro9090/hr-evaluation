@@ -112,3 +112,9 @@ def get_import_history(limit: int = 300):
 def delete_import_history(record_id: int):
     sb = get_supabase()
     sb.table("import_history").delete().eq("id", record_id).execute()
+
+def insert_import_history(data: dict):
+    sb = get_supabase()
+    data["import_date"] = datetime.utcnow().isoformat()
+    res = sb.table("import_history").insert(data).execute()
+    return res.data
